@@ -21,13 +21,10 @@ Morrow, a crow that never leaves the yard, is the bot. The open plot is the dead
 
 ## Status
 
-The site is ready; the token is **not launched**. The bot is the same engine as Cauldron ($BREW) and carries the same open findings. Do not launch until they are fixed:
+The site is ready; the token is **not launched**. Before launch:
 
-- Public launches on Pons are closed: check `canLaunch` for the operator wallet.
-- The bot never sweeps fees into the escrow, so it may never reach a claim.
-- It finds the curve through `token.curve()`, which the Pons docs do not list.
-- Buys have no slippage limit (`minTokensOut` 0 on the curve, 1 on Uniswap v4).
-- A failed Uniswap buy retries every poll with no backoff, spending gas.
+- Check `canLaunch` for the operator wallet: public launches on Pons are closed.
+- Run a mainnet simulation of a sweep and a buy. The local test suite uses stand-ins, so `getLaunchedToken`, `sweepFees`, the hook sweep and the Uniswap v4 quote are not yet checked against the real contracts.
 
 ## Quick start
 

@@ -7,7 +7,7 @@
  *
  * A stand-in escrow sits at the real Pons escrow address; the token and a curve with the Pons
  * curve's buy() signature are real contracts (test/PonsLike.sol, compiled into test/ponslike.json).
- * The bot under test is the unmodified bot/pons-burn-bot.ts. Checks marked FINDING record
+ * The bot under test is the real bot/pons-burn-bot.ts. Checks marked FINDING record
  * behaviour worth knowing before launch rather than failing the run.
  */
 import assert from "node:assert/strict";
@@ -96,7 +96,7 @@ async function main() {
 
   const token = (await new ethers.ContractFactory(ART.TestToken.abi, ART.TestToken.bytecode, deployer).deploy(T(1_000_000_000))) as ethers.Contract;
   await token.waitForDeployment();
-  const curve = (await new ethers.ContractFactory(ART.TestCurve.abi, ART.TestCurve.bytecode, deployer).deploy(await token.getAddress(), 100_000_000n)) as ethers.Contract;
+  const curve = (await new ethers.ContractFactory(ART.TestCurve.abi, ART.TestCurve.bytecode, deployer).deploy(await token.getAddress(), ESCROW, E("5"), T(900_000_000))) as ethers.Contract;
   await curve.waitForDeployment();
   const TOKEN = await token.getAddress();
   const CURVE = await curve.getAddress();
@@ -192,6 +192,30 @@ async function main() {
   await sleep(4000);
   ok((await dead()) - dead3 === burned3 && (await status()).totalCyclesExecuted === 3, "a second restart after the run is done burns nothing more");
 
+  await stopEngine();
+
+  console.log("\nA buy that would be sandwiched");
+  startEngine(env);
+  await until("the bot to come back", () => status());
+  await fundEscrow("0.02");
+  await cyclesDone(4);
+  const dead5 = await dead();
+  await (await curve.setRigged(true)).wait();
+  await fundEscrow("0.01");
+  await until("the rigged buy to be refused", async () => (/Cycle execution error[\s\S]*Retrying in 30s/.test(log()) ? true : null));
+  ok((await dead()) === dead5, "a buy far under its quote reverts and nothing is burned");
+  const nonce5 = await provider.getTransactionCount(operator.address);
+  await sleep(6000);
+  ok((await provider.getTransactionCount(operator.address)) === nonce5, "the failed buy spends no gas and waits before retrying");
+  await (await curve.setRigged(false)).wait();
+  await cyclesDone(5);
+  ok((await dead()) > dead5, "the same run finishes once the price is fair again");
+
+  console.log("\nFees that only reach the escrow after a sweep");
+  const t6 = await bal(treasury);
+  await (await curve.addFees({ value: E("0.02") })).wait();
+  await cyclesDone(6);
+  ok((await bal(treasury)) - t6 >= E("0.02"), "the bot swept the curve's fees to the escrow and ran the offering");
   await stopEngine();
 
   console.log("\nAdmin API without ADMIN_SECRET");

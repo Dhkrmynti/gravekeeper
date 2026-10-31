@@ -14,7 +14,8 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { ethers } from "ethers";
-import { buildUniswapV4Buy, findGraduationPool, type PoolKey } from "./uniswap-v4";
+import { buildUniswapV4Buy, quoteV4Buy } from "./uniswap-v4";
+import { hookFeeBps, PHASE_POOL_CREATED, quoteCurveBuy, readLaunch, sweepFees, unsweptFees, type Launch } from "./pons";
 
 // Native .env parser (tanpa ketergantungan modul eksternal)
 try {
@@ -113,8 +114,11 @@ const PONS_FEE_ESCROW = "0xd3AFEB2a57f70eF218Aa82451c51B2fb0416Ac9e";
 const DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD";
 const UNISWAP_V4_UNIVERSAL_ROUTER = process.env.UNISWAP_ROUTER_ADDRESS || process.env.VITE_UNISWAP_ROUTER_ADDRESS || "0x8876789976dEcBfCbBbe364623C63652db8C0904";
 
-/** The graduation pool, found once the curve has graduated. */
-let v4Pool: PoolKey | null = null;
+/** The most a buy may return under the quote before it reverts, in bps. */
+const BUY_SLIPPAGE_BPS = BigInt(process.env.BUY_SLIPPAGE_BPS || "500");
+const SWEEP_COOLDOWN_MS = 5 * 60_000;
+const MAX_BACKOFF_MS = 15 * 60_000;
+const atLeast = (expected: bigint, feeBps = 0n) => (expected * (10_000n - feeBps) * (10_000n - BUY_SLIPPAGE_BPS)) / 100_000_000n;
 
 // ABIs
 const ESCROW_ABI = [
@@ -252,6 +256,11 @@ async function settle(hash: string): Promise<boolean> {
 
 // Execution Cycle
 let isExecuting = false;
+// After a failed run the bot waits, doubling up to MAX_BACKOFF_MS, so a broken buy can't drain the gas wallet
+let failures = 0;
+let retryAt = 0;
+let lastSweepAt = 0;
+let warnedRecipient = false;
 
 async function executeCycle() {
   if (isExecuting) {
@@ -274,10 +283,19 @@ async function executeCycle() {
     return;
   }
 
+  if (Date.now() < retryAt) return;
+
+  // The factory's launch record names the curve and the pool; older stand-ins only have token.curve()
+  const launch: Launch | null = await readLaunch(provider, currentConfig.tokenAddress);
+  if (launch && !warnedRecipient && launch.creatorFeeRecipient.toLowerCase() !== wallet.address.toLowerCase()) {
+    warnedRecipient = true;
+    addLog("warn", `The creator fee recipient is ${launch.creatorFeeRecipient}, not the operator wallet: the bot can't claim these fees.`);
+  }
+
   // Auto-detect Curve from Token CA if not set or different
   try {
     const tokenContract = new ethers.Contract(currentConfig.tokenAddress, ERC20_ABI, wallet);
-    const resolvedCurve = await tokenContract.curve();
+    const resolvedCurve = launch?.curve ?? (await tokenContract.curve());
     if (resolvedCurve && ethers.isAddress(resolvedCurve) && resolvedCurve !== ethers.ZeroAddress) {
       if (currentConfig.curveAddress.toLowerCase() !== resolvedCurve.toLowerCase()) {
         addLog("info", `[AUTO-SYNC] Connected to detected Pons Curve: ${resolvedCurve}`);
@@ -366,6 +384,25 @@ async function executeCycle() {
     // Jangan gunakan saldo wallet untuk memicu eksekusi, agar dana KEEP dan cadangan gas tidak terpicu buyback sendiri.
     const shouldExecute = claimableWei >= thresholdWei && claimableWei > 0n;
 
+    // Trades leave fees on the curve or hook; they reach the escrow only after a sweep. The total
+    // includes the protocol's share, so this may sweep a little early. A failed sweep never blocks a claim.
+    if (!pending && !shouldExecute && Date.now() - lastSweepAt > SWEEP_COOLDOWN_MS) {
+      try {
+        const unswept = await unsweptFees(provider, currentConfig.tokenAddress, currentConfig.curveAddress, launch);
+        if (unswept > 0n && claimableWei + unswept >= thresholdWei) {
+          lastSweepAt = Date.now();
+          addLog("info", `Sweeping ${ethers.formatEther(unswept)} ETH of unswept fees to the escrow...`);
+          const sweepTx = await sweepFees(wallet, currentConfig.tokenAddress, currentConfig.curveAddress, launch, await nextNonce());
+          addLog("info", `Sweep Tx broadcasted: ${sweepTx.hash}`);
+          await sweepTx.wait();
+          addLog("success", "Fees swept to the escrow.");
+        }
+      } catch (e: any) {
+        lastSweepAt = Date.now();
+        addLog("warn", `Sweep skipped: ${e.shortMessage || e.message || e}`);
+      }
+    }
+
     // A run is saved after every step (bot-run.json), so a crash or restart picks the same run
     // back up: nothing is claimed or bought twice and claimed ETH is never left behind.
     if (!pending) {
@@ -428,7 +465,9 @@ async function executeCycle() {
       }
       if (!run.bought) {
         botState.status = "buyback";
-        const isGraduated = await curve.graduated().catch(() => false);
+        if (launch && launch.pairToken !== ethers.ZeroAddress) throw new Error("Only native ETH launches are supported.");
+        const isGraduated = launch ? launch.phase === PHASE_POOL_CREATED : await curve.graduated().catch(() => false);
+        if (launch && !isGraduated && launch.phase !== 0) throw new Error(`The launch is between the curve and its pool (phase ${launch.phase}); waiting.`);
         const walletBal = await provider.getBalance(wallet.address);
         const maxSpendable = walletBal > gasBuffer ? walletBal - gasBuffer : 0n;
         // Only what this run claimed is spent, never the rest of the wallet
@@ -438,23 +477,18 @@ async function executeCycle() {
           return;
         }
         let buyTx: ethers.TransactionResponse;
-        if (isGraduated && !v4Pool) {
-          v4Pool = await findGraduationPool(provider, currentConfig.tokenAddress, currentConfig.curveAddress);
-          if (!v4Pool) throw new Error("The curve graduated but its Uniswap v4 pool isn't found yet; retrying.");
-          addLog("info", `Uniswap v4 pool found: fee ${v4Pool.fee}, tick spacing ${v4Pool.tickSpacing}, hook ${v4Pool.hooks}`);
-        }
         if (isGraduated) {
-          addLog("info", `[2/3] Token has graduated! Executing Buyback on Uniswap v4 Router (${ethers.formatEther(buyAmountWei)} ETH)...`);
-          buyTx = await wallet.sendTransaction({
-            to: UNISWAP_V4_UNIVERSAL_ROUTER,
-            value: buyAmountWei,
-            data: buildUniswapV4Buy(currentConfig.tokenAddress, buyAmountWei, v4Pool!),
-            gasLimit: 400000n,
-            nonce: await nextNonce()
-          });
+          const expected = await quoteV4Buy(provider, currentConfig.tokenAddress, launch!.pool, buyAmountWei);
+          const minOut = atLeast(expected, (await hookFeeBps(provider, currentConfig.tokenAddress)) + launch!.creatorTaxBps);
+          addLog("info", `[2/3] Token has graduated! Executing Buyback on Uniswap v4 Router (${ethers.formatEther(buyAmountWei)} ETH, min ${ethers.formatUnits(minOut, 18)})...`);
+          const swap = { to: UNISWAP_V4_UNIVERSAL_ROUTER, value: buyAmountWei, data: buildUniswapV4Buy(currentConfig.tokenAddress, buyAmountWei, launch!.pool, minOut) };
+          // estimated first: a swap that would revert stops here and spends no gas
+          const gas = await wallet.estimateGas(swap);
+          buyTx = await wallet.sendTransaction({ ...swap, gasLimit: (gas * 13n) / 10n, nonce: await nextNonce() });
         } else {
-          addLog("info", `[2/3] Token on Bonding Curve. Executing Buyback on Curve DEX (${ethers.formatEther(buyAmountWei)} ETH)...`);
-          buyTx = await curve.buy(buyAmountWei, 0n, wallet.address, { value: buyAmountWei, nonce: await nextNonce() });
+          const minOut = atLeast(await quoteCurveBuy(provider, currentConfig.curveAddress, buyAmountWei, wallet.address));
+          addLog("info", `[2/3] Token on Bonding Curve. Executing Buyback on Curve DEX (${ethers.formatEther(buyAmountWei)} ETH, min ${ethers.formatUnits(minOut, 18)})...`);
+          buyTx = await curve.buy(buyAmountWei, minOut, wallet.address, { value: buyAmountWei, nonce: await nextNonce() });
         }
         run.buyTx = buyTx.hash;
         savePending(run);
@@ -531,8 +565,12 @@ async function executeCycle() {
     botState.totalCyclesExecuted++;
     saveConfigToFile({ cycleCount: botState.totalCyclesExecuted });
     savePending(null);
+    failures = 0;
   } catch (err: any) {
-    addLog("error", `Cycle execution error: ${err.message || err}`);
+    failures++;
+    const wait = Math.min(MAX_BACKOFF_MS, 30_000 * 2 ** (failures - 1));
+    retryAt = Date.now() + wait;
+    addLog("error", `Cycle execution error: ${err.shortMessage || err.message || err}. Retrying in ${wait / 1000}s.`);
   } finally {
     isExecuting = false;
     botState.status = "standby";

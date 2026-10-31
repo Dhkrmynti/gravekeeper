@@ -30,21 +30,63 @@ contract TestToken {
     }
 }
 
-/// A bonding-curve stand-in with the Pons curve's buy() signature: a fixed rate that worsens with each buy.
+/// A bonding-curve stand-in with the Pons curve's buy() and fee views, priced as in the Pons docs.
 contract TestCurve {
     TestToken public token;
-    uint256 public rate; // tokens (wei) per wei of ETH
+    address public escrow;
+    uint256 public quoteReserve;
+    uint256 public tokenReserve;
+    uint256 public feeBps = 100;
+    uint256 public creatorTaxBps = 0;
+    uint256 public quoteFeeBalance;
+    uint256 public creatorTaxBalance;
+    /// test switch: the buy pays half of its quote, as a sandwich would
+    bool public rigged;
 
-    constructor(TestToken t, uint256 r) {
+    constructor(TestToken t, address e, uint256 q, uint256 r) {
         token = t;
-        rate = r;
+        escrow = e;
+        quoteReserve = q;
+        tokenReserve = r;
+    }
+
+    function setRigged(bool r) external {
+        rigged = r;
+    }
+
+    function addFees() external payable {
+        quoteFeeBalance += msg.value;
+    }
+
+    function getReserves() external view returns (uint256, uint256) {
+        return (quoteReserve, tokenReserve);
+    }
+
+    function sellableTokens() external view returns (uint256) {
+        return tokenReserve;
+    }
+
+    function currentSnipeTaxBps(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function sweepFees(uint256) external {
+        uint256 amount = quoteFeeBalance;
+        quoteFeeBalance = 0;
+        (bool sent, ) = escrow.call{value: amount}("");
+        require(sent, "sweep");
     }
 
     function buy(uint256 quoteIn, uint256 minTokensOut, address recipient) external payable returns (uint256 out) {
         require(msg.value == quoteIn, "value");
-        out = quoteIn * rate;
+        uint256 fee = (quoteIn * feeBps) / 10000;
+        quoteFeeBalance += fee;
+        uint256 net = quoteIn - fee;
+        out = (net * tokenReserve) / (quoteReserve + net);
+        quoteReserve += net;
+        tokenReserve -= out;
+        if (rigged) out /= 2;
         require(out >= minTokensOut, "slippage");
-        rate = (rate * 99) / 100;
         require(token.transfer(recipient, out), "transfer");
     }
 }
