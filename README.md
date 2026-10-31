@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="public/grave-logo-transparent.png" alt="Gravekeeper" width="180" />
+</p>
+
 <h1 align="center">Gravekeeper ($GRAVE)</h1>
 
 <p align="center"><b>Here lies the supply.</b><br/>
