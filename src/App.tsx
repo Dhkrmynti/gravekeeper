@@ -271,14 +271,14 @@ export function App() {
             <div data-stone className="stone order-1 w-full px-5 pb-10 pt-14 text-center sm:px-12 sm:pt-16 lg:order-2">
               <p className="carved m-0 label">Here lies</p>
               <h1 id="hero-title" className="carved m-0 mt-2 display text-[clamp(3.1rem,9vw,5.6rem)] leading-none">
-                {isConfigured || totalTokensBurned > 0 ? (
+                {totalTokensBurned > 0 ? (
                   <LiveNumber value={totalTokensBurned} format={(n) => formatNumber(n)} />
                 ) : (
                   'The Supply'
                 )}
               </h1>
               <p className="carved m-0 mt-3 display text-[1.5rem] italic">
-                {isConfigured || totalTokensBurned > 0 ? `${tokenSymbol}, ${burnedPercent > 0 ? (Math.floor(burnedPercent * 100) / 100).toFixed(2) : '0.00'}% of it, at rest` : `${tokenSymbol}, one token at a time`}
+                {totalTokensBurned > 0 ? `${tokenSymbol}, ${burnedPercent > 0 ? (Math.floor(burnedPercent * 100) / 100).toFixed(2) : '0.00'}% of it, at rest` : `${tokenSymbol}, one token at a time`}
               </p>
               <div className="mx-auto my-6 h-px w-24 bg-[#172024]/50" aria-hidden="true" />
               <p data-hero-line className="carved m-0 mx-auto max-w-[42ch] text-[1.02rem] font-medium leading-relaxed">
